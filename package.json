@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-observational-memory",
+  "version": "0.1.0-experimental.0",
+  "description": "[EXPERIMENTAL] Observational memory plugin for opencode - persistent cross-session memory using Observer/Reflector background agents with prompt-caching economics",
+  "type": "module",
+  "license": "MIT",
+  "author": "wmisiedjan",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/opencode-observational-memory/plugin"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ai",
+    "memory",
+    "observational-memory",
+    "agent-memory",
+    "llm"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:watch": "bun test --watch"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.2.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.2.12",
+    "@types/bun": "latest",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

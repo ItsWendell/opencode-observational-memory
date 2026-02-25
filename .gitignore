@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.js.map
+bun.lock
+.turbo/
+
+# Observation logs are project-local by default; users may choose to commit or ignore these
+# .opencode/observations/
