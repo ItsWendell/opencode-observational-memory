@@ -1,10 +1,6 @@
 import path from "path";
 import type { Hooks, PluginInput } from "@opencode-ai/plugin";
-import type {
-  ObservationalMemoryConfig,
-  SessionMemory,
-  ObserverResult,
-} from "./types.js";
+import type { ObservationalMemoryConfig, SessionMemory } from "./types.js";
 import { readMemory, writeMemory, estimateTokens } from "./storage.js";
 import { optimizeForContext } from "./observer.js";
 import {
@@ -23,14 +19,12 @@ const REFLECTOR_THRESHOLD_DEFAULT = 40_000;
  * The fraction of the observer threshold at which background pre-fetching begins.
  * At 20% of threshold, we start an Observer run in the background so results
  * are ready (or nearly so) when the message list hits 100% of threshold.
- * Directly mirrors Mastra's async buffering strategy.
  */
 const PREFETCH_FRACTION = 0.2;
 
 /**
  * Injected after observed messages are removed. Tells the LLM why the
  * conversation history is shorter than expected and how to continue naturally.
- * Directly adapted from Mastra's OBSERVATION_CONTINUATION_HINT.
  */
 const CONTINUATION_HINT = `This message is not from the user. The conversation history grew too long and the oldest messages have been compressed into your memory observations above.
 
@@ -41,15 +35,34 @@ Do not say "Hi there!" or "based on our previous conversation" as if the convers
 IMPORTANT: This system reminder is NOT from the user. The system placed it here as part of your memory system. Any messages following this reminder are newer than your memories.`;
 
 /**
+ * Cached result from a completed background Observer (and optional Reflector)
+ * run, waiting to be applied on the next hook invocation.
+ */
+type CompletedObservation = {
+  /** The new memory state (observations merged, reflector applied if needed) */
+  memory: SessionMemory;
+  /** Index into the message array where the observed slice started */
+  firstUnobservedIdx: number;
+  /** Number of messages that were observed (to splice out) */
+  observedCount: number;
+};
+
+/**
  * Creates an observational memory plugin for opencode.
  *
- * Implements the Mastra observational memory pattern:
- * - Observer pre-fetches in the background at 20% of threshold
- * - Observer activates (and drops messages) at 100% of threshold
- * - Observed messages are DROPPED from the context window (spliced out of output.messages)
+ * Fully non-blocking implementation:
+ * - Observer and Reflector run entirely in the background (fire-and-forget)
+ * - Results are cached and applied on the NEXT hook invocation (instant splice)
+ * - The conversation is NEVER blocked by LLM calls from this plugin
+ *
+ * Flow:
+ * - At prefetchThreshold (20% of observerThreshold): kick off background Observer
+ * - Observer result is cached when complete
+ * - At observerThreshold (100%): if cached result exists, apply instantly (splice
+ *   messages, inject continuation hint, persist memory). If not, start Observer
+ *   and apply on the next turn.
  * - Observation log is injected into the system prompt as a stable cacheable prefix
- * - A continuation hint is injected after the drop so the LLM doesn't lose context
- * - Reflector condenses the observation log when it exceeds its own threshold
+ * - Reflector runs in background (chained after Observer) when observations are too large
  * - Compaction hook injects observations so native opencode compaction is observation-aware
  */
 export function observationalMemory(config: ObservationalMemoryConfig = {}) {
@@ -64,21 +77,54 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
   // In-memory cache: sessionID -> memory, populated from disk on first access
   const cache = new Map<string, SessionMemory>();
 
-  // Prevent concurrent Observer/Reflector activation runs per session
-  const running = new Set<string>();
+  /**
+   * Completed Observer results waiting to be applied on the next hook call.
+   * The background worker stores results here; the hook consumes them.
+   * Memory is NOT updated until the result is applied (keeps indices stable).
+   */
+  const completedObservation = new Map<string, CompletedObservation>();
 
   /**
-   * Background pre-fetch state per session.
-   * At prefetchThreshold we start the Observer in the background; the result
-   * promise sits here until the session hits observerThreshold, at which point
-   * we await the already-in-flight result instead of starting a fresh call.
-   * After the result is consumed the slot is cleared for the next cycle.
+   * Sessions that currently have a background Observer (+ optional Reflector)
+   * in flight. Prevents concurrent runs for the same session.
    */
-  const prefetch = new Map<string, Promise<ObserverResult>>();
+  const observerInFlight = new Set<string>();
 
-  function log(...args: unknown[]) {
-    if (debug) console.log("[observational-memory]", ...args);
+  // ── Leveled logger ──────────────────────────────────────────────────────
+  // - debug: noisy per-turn details (token checks, injections) — only when config.debug=true
+  // - info:  lifecycle events (observer start/complete, apply) — only when config.debug=true
+  // - warn:  degenerate outputs, missing config — always visible
+  // - error: failures — always visible
+  const PREFIX = "[observational-memory]";
+
+  /** Truncate session ID for readable logs: ses_36987ccd7ffe... → ses_3698..7ffe */
+  function shortID(sessionID: string): string {
+    if (sessionID.length <= 16) return sessionID;
+    return sessionID.slice(0, 8) + ".." + sessionID.slice(-4);
   }
+
+  /** Format token count as "15.0k (50%)" relative to the observer threshold */
+  function fmtTokens(tokens: number): string {
+    const pct = Math.round((tokens / observerThreshold) * 100);
+    return tokens >= 1000
+      ? `${(tokens / 1000).toFixed(1)}k (${pct}%)`
+      : `${tokens} (${pct}%)`;
+  }
+
+  const log = {
+    debug(...args: unknown[]) {
+      if (debug) console.log(PREFIX, ...args);
+    },
+    info(...args: unknown[]) {
+      if (debug) console.log(PREFIX, ...args);
+    },
+    warn(...args: unknown[]) {
+      console.warn(PREFIX, ...args);
+    },
+    error(...args: unknown[]) {
+      console.error(PREFIX, ...args);
+    },
+  };
 
   async function getMemory(
     storageDir: string,
@@ -112,18 +158,134 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
       : undefined;
 
     if (!config.model) {
-      console.warn(
-        "[observational-memory] WARNING: No model configured. Observer/Reflector will use the session's main model, which may be expensive. Consider setting `model` to a cheap model like 'anthropic/claude-haiku-4-5-20251001' or 'openai/gpt-4o-mini'.",
+      log.warn(
+        "No model configured — Observer/Reflector will use the session's main model, which may be expensive.",
+        "Set `model` to e.g. 'anthropic/claude-haiku-4-5-20251001'.",
       );
     }
 
-    log("initialized", {
+    log.info("initialized", {
       storageDir,
       observerThreshold,
       reflectorThreshold,
       prefetchThreshold,
-      modelOverride,
+      model: modelOverride
+        ? `${modelOverride.providerID}/${modelOverride.modelID}`
+        : "(session default)",
     });
+
+    /**
+     * Starts the Observer (and optional Reflector) in the background.
+     * Never blocks — the result is stored in completedObservation for the
+     * next hook invocation to apply.
+     *
+     * NOTE: runObserver synchronously formats the messages into a prompt
+     * string before its first `await`, so message references are consumed
+     * immediately and safe from later mutation.
+     */
+    function startBackgroundObserver(
+      sessionID: string,
+      agentInput: AgentCallInput,
+      unobserved: Parameters<
+        NonNullable<Hooks["experimental.chat.messages.transform"]>
+      >[1]["messages"],
+      currentMemory: SessionMemory,
+      firstUnobservedIdx: number,
+      unobservedTokens: number,
+    ) {
+      observerInFlight.add(sessionID);
+      const sid = shortID(sessionID);
+
+      (async () => {
+        try {
+          const t0 = performance.now();
+          const result = await runObserver(
+            agentInput,
+            unobserved,
+            currentMemory.observations || undefined,
+            config.observerInstruction,
+          );
+          const observerMs = performance.now() - t0;
+
+          if (result.degenerate || !result.observations) {
+            log.warn(
+              `[${sid}] Observer returned ${result.degenerate ? "degenerate" : "empty"} output after ${(observerMs / 1000).toFixed(1)}s — skipping`,
+            );
+            return;
+          }
+
+          log.info(
+            `[${sid}] Observer completed in ${(observerMs / 1000).toFixed(1)}s — ${result.observations.length} chars of new observations`,
+          );
+
+          // Merge new observations with existing ones
+          const newObservations = currentMemory.observations
+            ? currentMemory.observations + "\n\n" + result.observations
+            : result.observations;
+
+          let newMemory: SessionMemory = {
+            ...currentMemory,
+            observations: newObservations,
+            currentTask: result.currentTask,
+            suggestedResponse: result.suggestedResponse,
+            lastObservedMessageIndex:
+              firstUnobservedIdx + unobserved.length - 1,
+            lastObservedTokens: unobservedTokens,
+            lastObservedAt: Date.now(),
+          };
+
+          // Run Reflector in the same background pipeline if observations are too large
+          const obsTokens = estimateTokens(newObservations);
+          if (obsTokens >= reflectorThreshold) {
+            log.info(
+              `[${sid}] Reflector started — observations at ${fmtTokens(obsTokens)} exceed reflector threshold`,
+            );
+            const t1 = performance.now();
+            const reflected = await runReflector(
+              agentInput,
+              newObservations,
+              reflectorThreshold,
+              config.reflectorInstruction,
+            );
+            const reflectorMs = performance.now() - t1;
+
+            if (!reflected.degenerate && reflected.observations) {
+              const afterTokens = estimateTokens(reflected.observations);
+              newMemory = {
+                ...newMemory,
+                observations: reflected.observations,
+                suggestedResponse:
+                  reflected.suggestedResponse ?? newMemory.suggestedResponse,
+                lastReflectedAt: Date.now(),
+              };
+              log.info(
+                `[${sid}] Reflector completed in ${(reflectorMs / 1000).toFixed(1)}s — condensed ${fmtTokens(obsTokens)} → ${fmtTokens(afterTokens)}`,
+              );
+            } else {
+              log.warn(
+                `[${sid}] Reflector returned ${reflected.degenerate ? "degenerate" : "empty"} output after ${(reflectorMs / 1000).toFixed(1)}s`,
+              );
+            }
+          }
+
+          // Cache the result for the next hook invocation to apply.
+          // Memory is NOT saved to cache/disk yet — that happens at apply time
+          // so that memory.lastObservedMessageIndex stays stable for token
+          // calculations in the hook.
+          completedObservation.set(sessionID, {
+            memory: newMemory,
+            firstUnobservedIdx,
+            observedCount: unobserved.length,
+          });
+
+          log.info(`[${sid}] result cached, will apply on next turn`);
+        } catch (err) {
+          log.error(`[${sid}] background Observer/Reflector failed:`, err);
+        } finally {
+          observerInFlight.delete(sessionID);
+        }
+      })();
+    }
 
     return {
       /**
@@ -158,32 +320,31 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
         ].join("\n");
 
         output.system[0] = block + "\n\n" + (output.system[0] ?? "");
-        log("injected observations into system prompt", {
-          sessionID,
-          chars: optimized.length,
-        });
+        log.debug(
+          `[${shortID(sessionID)}] injected ${optimized.length} chars of observations into system prompt`,
+        );
       },
 
       /**
-       * Core observational memory logic. Called before every LLM request.
+       * Core observational memory logic — fully non-blocking.
+       *
+       * Called before every LLM request. Never awaits LLM calls; all Observer
+       * and Reflector work happens in the background.
        *
        * Flow:
-       * 1. Count unobserved message tokens (chars/4 estimate on text content)
-       * 2. If above prefetch threshold but below observer threshold: kick off
-       *    background Observer run and return (LLM request proceeds normally)
-       * 3. If above observer threshold: await the pre-fetched result (or start
-       *    a fresh Observer run if pre-fetch wasn't triggered)
-       * 4. Splice observed messages OUT of output.messages
-       * 5. Inject a continuation hint so the LLM knows why history is shorter
-       * 6. Persist new observations; run Reflector if observation log is too large
+       * 1. If a completed background result exists AND tokens >= observerThreshold:
+       *    apply it instantly (splice messages, inject hint, persist memory)
+       * 2. If tokens >= prefetchThreshold and no Observer is running: start
+       *    background Observer (fire-and-forget)
+       * 3. Otherwise: return immediately, no work to do
        */
       "experimental.chat.messages.transform": async (_input, output) => {
         const sessionID = output.messages[0]?.info.sessionID;
         if (!sessionID) return;
         if (childSessions.has(sessionID)) return;
-        if (running.has(sessionID)) return;
 
         const memory = await getMemory(storageDir, sessionID);
+        const sid = shortID(sessionID);
 
         // Find the first message after the last observed index
         const firstUnobservedIdx = memory.lastObservedMessageIndex + 1;
@@ -192,14 +353,20 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
         // Estimate tokens in the unobserved slice (char/4 heuristic on text content)
         const unobservedTokens = estimateMessageTokens(unobserved);
 
-        log("token check", {
-          sessionID,
-          firstUnobservedIdx,
-          unobservedCount: unobserved.length,
-          unobservedTokens,
-          prefetchThreshold,
-          observerThreshold,
-        });
+        // Only log the full token breakdown when something interesting is
+        // happening (above prefetch threshold or state to report). Avoids
+        // flooding the console on every idle turn.
+        if (
+          unobservedTokens >= prefetchThreshold ||
+          completedObservation.has(sessionID) ||
+          observerInFlight.has(sessionID)
+        ) {
+          log.debug(
+            `[${sid}] tokens: ${fmtTokens(unobservedTokens)}, ${unobserved.length} msgs unobserved` +
+              (observerInFlight.has(sessionID) ? " [observer running]" : "") +
+              (completedObservation.has(sessionID) ? " [result cached]" : ""),
+          );
+        }
 
         const agentInput: AgentCallInput = {
           client: input.client,
@@ -208,152 +375,72 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
           model: modelOverride,
         };
 
-        // ── Pre-fetch zone ──────────────────────────────────────────────────
-        // At 20% of threshold, start Observer in background so its result is
-        // ready (or nearly ready) by the time we reach 100% threshold.
-        if (
-          unobservedTokens >= prefetchThreshold &&
-          unobservedTokens < observerThreshold &&
-          !prefetch.has(sessionID)
-        ) {
-          log("starting background Observer pre-fetch", {
-            sessionID,
-            unobservedTokens,
-          });
-          // Fire-and-forget: store the promise, do not await
-          prefetch.set(
-            sessionID,
-            runObserver(
-              agentInput,
-              unobserved,
-              memory.observations || undefined,
-              config.observerInstruction,
-            ).catch((err) => {
-              log("background Observer pre-fetch error", err);
-              prefetch.delete(sessionID);
-              return { observations: "", degenerate: true } as ObserverResult;
-            }),
+        // ── Apply zone ──────────────────────────────────────────────────────
+        // If a background Observer has completed and context is large enough,
+        // apply the cached result instantly. This is pure array manipulation —
+        // no LLM calls, no blocking.
+        const completed = completedObservation.get(sessionID);
+        if (completed && unobservedTokens >= observerThreshold) {
+          completedObservation.delete(sessionID);
+
+          // Persist the new memory state
+          await saveMemory(storageDir, sessionID, completed.memory);
+
+          // Drop observed messages from the context window
+          output.messages.splice(
+            completed.firstUnobservedIdx,
+            completed.observedCount,
           );
-          return; // Let this turn proceed normally
-        }
 
-        // Below both thresholds — nothing to do yet
-        if (unobservedTokens < observerThreshold) return;
-
-        // ── Activation zone ─────────────────────────────────────────────────
-        running.add(sessionID);
-        try {
-          log("activating Observer", { sessionID, unobservedTokens });
-
-          // Consume the pre-fetched promise if it exists, otherwise run fresh
-          const pending = prefetch.get(sessionID);
-          prefetch.delete(sessionID);
-
-          const result = await (pending ??
-            runObserver(
-              agentInput,
-              unobserved,
-              memory.observations || undefined,
-              config.observerInstruction,
-            ));
-
-          if (result.degenerate || !result.observations) {
-            log("Observer returned degenerate/empty output, skipping", {
-              sessionID,
-            });
-            return;
-          }
-
-          log("Observer produced observations", {
-            sessionID,
-            chars: result.observations.length,
-            fromPrefetch: !!pending,
-          });
-
-          // Append new observations to existing ones
-          const newObservations = memory.observations
-            ? memory.observations + "\n\n" + result.observations
-            : result.observations;
-
-          let updatedMemory: SessionMemory = {
-            ...memory,
-            observations: newObservations,
-            currentTask: result.currentTask,
-            suggestedResponse: result.suggestedResponse,
-            lastObservedMessageIndex:
-              firstUnobservedIdx + unobserved.length - 1,
-            lastObservedTokens: unobservedTokens,
-            lastObservedAt: Date.now(),
-          };
-
-          // Run Reflector if observation log is now too large
-          const obsTokens = estimateTokens(newObservations);
-          if (obsTokens >= reflectorThreshold) {
-            log("running Reflector", { sessionID, obsTokens });
-            const reflected = await runReflector(
-              agentInput,
-              newObservations,
-              reflectorThreshold,
-              config.reflectorInstruction,
-            );
-            if (!reflected.degenerate && reflected.observations) {
-              updatedMemory = {
-                ...updatedMemory,
-                observations: reflected.observations,
-                suggestedResponse:
-                  reflected.suggestedResponse ??
-                  updatedMemory.suggestedResponse,
-                lastReflectedAt: Date.now(),
-              };
-              log("Reflector condensed observations", {
-                sessionID,
-                before: obsTokens,
-                after: estimateTokens(reflected.observations),
-              });
-            }
-          }
-
-          await saveMemory(storageDir, sessionID, updatedMemory);
-
-          // ── Drop observed messages from the context window ──────────────────
-          // This is the core Mastra mechanism: observed messages are removed and
-          // replaced by the observation log in the system prompt. The LLM sees
-          // the structured memory instead of raw token-heavy history.
-          const observedCount = unobserved.length;
-          output.messages.splice(firstUnobservedIdx, observedCount);
-
-          // ── Inject continuation hint ────────────────────────────────────────
-          // After dropping messages, inject a synthetic message explaining the gap.
-          // Without this the LLM gets confused by the sudden history shortening.
-          // Insert it at firstUnobservedIdx (right after the retained messages).
+          // Inject continuation hint after the splice point
           const hint = {
             info: {
-              ...output.messages[firstUnobservedIdx - 1]?.info,
+              ...output.messages[completed.firstUnobservedIdx - 1]?.info,
               role: "user" as const,
               id: "om-continuation-hint",
             },
             parts: [
               {
                 type: "text" as const,
-                text: buildContinuationMessage(updatedMemory),
+                text: buildContinuationMessage(completed.memory),
               },
             ],
           };
           output.messages.splice(
-            firstUnobservedIdx,
+            completed.firstUnobservedIdx,
             0,
             hint as (typeof output.messages)[number],
           );
 
-          log("dropped observed messages and injected continuation hint", {
+          log.info(
+            `[${sid}] applied observations — dropped ${completed.observedCount} msgs, ${output.messages.length} remaining`,
+          );
+          return;
+        }
+
+        // ── Background Observer zone ────────────────────────────────────────
+        // At prefetchThreshold (20% of observer threshold), start the Observer
+        // in the background. The result will be cached and applied on the next
+        // hook invocation when tokens reach observerThreshold.
+        // Also covers the case where tokens jump straight past observerThreshold
+        // (e.g. large paste) — the Observer starts immediately and the result
+        // is applied on the next turn (one turn of slightly oversized context).
+        if (
+          unobservedTokens >= prefetchThreshold &&
+          !observerInFlight.has(sessionID) &&
+          !completedObservation.has(sessionID)
+        ) {
+          log.info(
+            `[${sid}] starting background Observer at ${fmtTokens(unobservedTokens)} — ${unobserved.length} msgs to observe`,
+          );
+          startBackgroundObserver(
             sessionID,
-            dropped: observedCount,
-            remaining: output.messages.length,
-          });
-        } catch (err) {
-          log("Observer/Reflector error", err);
-        } finally {
-          running.delete(sessionID);
+            agentInput,
+            unobserved,
+            memory,
+            firstUnobservedIdx,
+            unobservedTokens,
+          );
         }
       },
 
@@ -374,7 +461,9 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
             "When writing the compaction summary, reference it rather than re-deriving history from the raw messages.",
         );
 
-        log("injected observations into compaction context", { sessionID });
+        log.debug(
+          `[${shortID(sessionID)}] injected observations into compaction context`,
+        );
       },
     };
   };
