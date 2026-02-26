@@ -348,11 +348,44 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
         if (!sessionID) return;
         if (childSessions.has(sessionID)) return;
 
-        const memory = await getMemory(storageDir, sessionID);
+        let memory = await getMemory(storageDir, sessionID);
         const sid = shortID(sessionID);
 
         // Find the first message after the last observed index
-        const firstUnobservedIdx = memory.lastObservedMessageIndex + 1;
+        let firstUnobservedIdx = memory.lastObservedMessageIndex + 1;
+
+        // ── Post-compaction recovery ──────────────────────────────────────
+        // After native compaction, opencode rebuilds the message array from
+        // scratch (compaction summary + recent messages). Our saved
+        // lastObservedMessageIndex now points past the end of this shorter
+        // array, so slice() returns [] and tokens are permanently 0.
+        // Any cached observer result also has stale splice indices.
+        // Detect this and recover by resetting the index.
+        if (firstUnobservedIdx > output.messages.length) {
+          log.warn(
+            `[${sid}] post-compaction recovery — lastObservedMessageIndex ` +
+              `(${memory.lastObservedMessageIndex}) exceeds message count ` +
+              `(${output.messages.length}). Resetting index.`,
+          );
+
+          // Discard stale cached observation — its indices are invalid
+          if (completedObservation.has(sessionID)) {
+            log.warn(
+              `[${sid}] discarding stale cached observation result`,
+            );
+            completedObservation.delete(sessionID);
+          }
+
+          // Reset: mark all current messages as "already observed" since
+          // they're compaction summaries of content we already have
+          // observations for. New messages arriving after this point will
+          // be tracked normally.
+          const resetIndex = Math.max(output.messages.length - 1, -1);
+          memory = { ...memory, lastObservedMessageIndex: resetIndex };
+          await saveMemory(storageDir, sessionID, memory);
+          firstUnobservedIdx = resetIndex + 1;
+        }
+
         const unobserved = output.messages.slice(firstUnobservedIdx);
 
         // Estimate tokens in the unobserved slice (char/4 heuristic on text content)
