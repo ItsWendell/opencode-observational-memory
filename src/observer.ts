@@ -1,4 +1,5 @@
 import type { Hooks } from "@opencode-ai/plugin";
+import type { ObservationEntry, ObservationGroup } from "./types.js";
 
 // Extract message/part types from the plugin Hooks type
 type MessagesTransformOutput = Parameters<
@@ -6,29 +7,124 @@ type MessagesTransformOutput = Parameters<
 >[1];
 export type WithParts = MessagesTransformOutput["messages"][number];
 
+// ─── JSON Schemas ───────────────────────────────────────────────────────────
+
+/** Reusable schema fragment for an observation entry. */
+const OBSERVATION_ENTRY_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    priority: {
+      type: "string" as const,
+      enum: ["high", "medium", "low"],
+      description:
+        "high = user facts/preferences/goals/critical decisions, medium = project details/tool results/discoveries, low = minor details/uncertain observations",
+    },
+    time: {
+      type: "string" as const,
+      description: "24-hour time when the observation occurred, e.g. '14:30'",
+    },
+    text: {
+      type: "string" as const,
+      description: "The observation text — dense, specific, actionable",
+    },
+    children: {
+      type: "array" as const,
+      description:
+        "Sub-observations grouped under this entry (e.g. a sequence of tool calls)",
+      items: {
+        type: "object" as const,
+        properties: {
+          text: { type: "string" as const },
+        },
+        required: ["text"],
+      },
+    },
+  },
+  required: ["priority", "time", "text"],
+};
+
+/** Reusable schema fragment for a date-grouped set of observations. */
+const OBSERVATION_GROUP_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    date: {
+      type: "string" as const,
+      description: "Date header in 'Mon DD, YYYY' format, e.g. 'Feb 26, 2026'",
+    },
+    entries: {
+      type: "array" as const,
+      description: "Observations for this date, ordered chronologically",
+      items: OBSERVATION_ENTRY_SCHEMA,
+    },
+  },
+  required: ["date", "entries"],
+};
+
+/**
+ * JSON schema passed to opencode's structured output API for the Observer.
+ */
+export const OBSERVER_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    observations: {
+      type: "array",
+      description: "Array of date-grouped observation sets",
+      items: OBSERVATION_GROUP_SCHEMA,
+    },
+    currentTask: {
+      type: "string",
+      description:
+        "Current task(s) the agent is working on. State primary task first, then secondary/waiting tasks.",
+    },
+    suggestedResponse: {
+      type: "string",
+      description:
+        'Hint for the agent\'s immediate next message, e.g. "Continue debugging the auth issue" or "Wait for user to respond"',
+    },
+  },
+  required: ["observations"],
+};
+
+/**
+ * JSON schema for the Reflector output. Same observation structure, no
+ * currentTask (the reflector condenses — it doesn't track task state).
+ */
+export const REFLECTOR_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    observations: {
+      type: "array",
+      description:
+        "Condensed, consolidated observations — the assistant's entire memory going forward",
+      items: OBSERVATION_GROUP_SCHEMA,
+    },
+    suggestedResponse: {
+      type: "string",
+      description:
+        "Updated hint for the agent's immediate next message after reflection",
+    },
+  },
+  required: ["observations"],
+};
+
 // ─── Prompts ────────────────────────────────────────────────────────────────
 
 const EXTRACTION_INSTRUCTIONS = `CRITICAL: DISTINGUISH USER ASSERTIONS FROM QUESTIONS
 
 When the user TELLS you something, mark it as an assertion:
-- "I have two kids" → 🔴 (14:30) User stated they have two kids
-- "I work at Acme Corp" → 🔴 (14:31) User stated they work at Acme Corp
+- "I have two kids" → priority "high", text "User stated they have two kids"
+- "I work at Acme Corp" → priority "high", text "User stated they work at Acme Corp"
 
 When the user ASKS about something, mark it as a question/request:
-- "Can you help me with X?" → 🔴 (15:00) User asked for help with X
+- "Can you help me with X?" → priority "high", text "User asked for help with X"
 
 STATE CHANGES AND UPDATES:
 When a user indicates they are changing something, frame it as a state change:
 - "I'm switching from A to B" → "User is switching from A to B (replacing A)"
 
 TEMPORAL ANCHORING:
-Each observation has TWO potential timestamps:
-1. The time the statement was made (from message timestamp) - ALWAYS include as (HH:MM)
-2. The time being REFERENCED, if different - ONLY when you can provide an actual date
-
-FORMAT:
-- With time reference: (HH:MM) [observation]. (meaning DATE)
-- Without time reference: (HH:MM) [observation].
+Each observation has a "time" field (24-hour format, e.g. "14:30") from the message timestamp.
+If the observation references a different date/time, note it in the "text" field.
 
 PRESERVING DETAILS:
 - Capture specific names, numbers, identifiers, file paths, decisions, errors
@@ -36,12 +132,16 @@ PRESERVING DETAILS:
 - Short/medium user messages: capture near-verbatim in your own words
 - Long user messages: summarize with key quotes preserved
 
+GROUPING & CHILDREN:
+- Group repeated similar actions (tool calls, file browsing) under one parent entry using the "children" array:
+  { priority: "medium", time: "14:30", text: "Agent browsed auth source files",
+    children: [
+      { text: "viewed src/auth.ts — found token validation logic" },
+      { text: "viewed src/users.ts — found user lookup by email" }
+    ] }
+
 AVOIDING REPETITION:
 - Do NOT repeat observations already present in previous observations
-- Group repeated similar actions (tool calls, file browsing) under one parent:
-  🟡 (14:30) Agent browsed auth source files
-    * -> viewed src/auth.ts — found token validation logic
-    * -> viewed src/users.ts — found user lookup by email
 
 CONVERSATION CONTEXT to capture:
 - Decisions made (architectural, tooling, approach)
@@ -55,13 +155,12 @@ CONVERSATION CONTEXT to capture:
 const GUIDELINES = `- Be specific enough for the assistant to act on
 - Good: "User prefers short, direct answers without lengthy explanations"
 - Bad: "User stated a preference" (too vague)
-- Add 1 to 5 observations per exchange
-- Use terse language — sentences should be dense without unnecessary words
-- Make sure you start each observation with a priority emoji (🔴, 🟡, 🟢)
-- User messages are always 🔴 priority, as are completions of tasks
-- 🔴 High: explicit user facts, preferences, goals, critical decisions
-- 🟡 Medium: project details, tool results, discoveries
-- 🟢 Low: minor details, uncertain observations`;
+- Add 1 to 5 observation entries per exchange
+- Use terse language — text should be dense without unnecessary words
+- User messages are always "high" priority, as are completions of tasks
+- "high": explicit user facts, preferences, goals achieved, critical context
+- "medium": project details, learned information, tool results
+- "low": minor details, uncertain observations`;
 
 export function buildObserverSystemPrompt(instruction?: string): string {
   return `You are the memory consciousness of an AI coding assistant. Your observations will be the ONLY information the assistant has about past interactions.
@@ -72,43 +171,16 @@ ${EXTRACTION_INSTRUCTIONS}
 
 === OUTPUT FORMAT ===
 
-Your output MUST use XML tags. This allows the system to properly parse and manage memory over time.
+You will output structured data via the StructuredOutput tool. The structure is:
+- "observations": array of date groups, each with a "date" string and "entries" array
+- Each entry has: "priority" (high/medium/low), "time" (24h format), "text", optional "children" array
+- "currentTask": describe the current task(s) — primary first, then secondary/waiting
+- "suggestedResponse": hint for the agent's immediate next message
 
-Use priority levels:
-- 🔴 High: explicit user facts, preferences, goals achieved, critical context
-- 🟡 Medium: project details, learned information, tool results
-- 🟢 Low: minor details, uncertain observations
-
-Group related observations (like tool sequences) by indenting:
-* 🔴 (14:33) Agent debugging auth issue
-  * -> ran git status, found 3 modified files
-  * -> viewed auth.ts:45-60, found missing null check
-  * -> applied fix, tests now pass
-
-Group observations by date, then list each with 24-hour time.
-
-<observations>
-Date: Dec 4, 2025
-* 🔴 (14:30) User prefers direct answers
-* 🔴 (14:31) Working on feature X
-* 🟡 (14:32) User might prefer dark mode
-
-Date: Dec 5, 2025
-* 🔴 (09:15) Continued work on feature X
-</observations>
-
-<current-task>
-State the current task(s) explicitly:
-- Primary: What the agent is currently working on
-- Secondary: Other pending tasks (mark as "waiting for user" if appropriate)
-</current-task>
-
-<suggested-response>
-Hint for the agent's immediate next message. Examples:
-- "I've updated the navigation model. Let me walk you through the changes..."
-- "The assistant should wait for the user to respond before continuing."
-- Call the view tool on src/example.ts to continue debugging.
-</suggested-response>
+Priority levels:
+- "high": explicit user facts, preferences, goals achieved, critical context
+- "medium": project details, learned information, tool results
+- "low": minor details, uncertain observations
 
 === GUIDELINES ===
 
@@ -116,7 +188,7 @@ ${GUIDELINES}
 
 Remember: These observations are the assistant's ONLY memory. Make them count.
 
-User messages are extremely important. If the user asks a question or gives a new task, make it clear in <current-task> that this is the priority.${instruction ? `\n\n=== CUSTOM INSTRUCTIONS ===\n\n${instruction}` : ""}`;
+User messages are extremely important. If the user asks a question or gives a new task, make it clear in "currentTask" that this is the priority.${instruction ? `\n\n=== CUSTOM INSTRUCTIONS ===\n\n${instruction}` : ""}`;
 }
 
 // ─── Message formatter ───────────────────────────────────────────────────────
@@ -179,71 +251,66 @@ export function formatMessagesForObserver(messages: WithParts[]): string {
     .join("\n\n---\n\n");
 }
 
-// ─── Output parser ───────────────────────────────────────────────────────────
-
-export type ParsedObserver = {
-  observations: string;
-  currentTask?: string;
-  suggestedResponse?: string;
-};
+// ─── Serialization ───────────────────────────────────────────────────────────
 
 /**
- * Parses the Observer's XML-structured output.
- * Extracts <observations>, <current-task>, and <suggested-response> blocks.
- * Falls back to extracting list items if XML tags are missing.
+ * Serializes structured observations to a human-readable text format for
+ * injection into the system prompt or for passing as context to the Observer
+ * and Reflector.
+ *
+ * Output looks like:
+ *   Date: Feb 26, 2026
+ *   * 🔴 (14:30) User prefers direct answers
+ *   * 🟡 (14:32) Agent browsed auth source files
+ *     * -> viewed src/auth.ts — found token validation logic
  */
-export function parseObserverOutput(raw: string): ParsedObserver {
-  const obs = extractXmlBlock(raw, "observations");
-  const currentTask = extractXmlTag(raw, "current-task");
-  const suggestedResponse = extractXmlTag(raw, "suggested-response");
-
-  const observations = sanitizeLines(obs ?? extractListItems(raw));
-
-  return { observations, currentTask, suggestedResponse };
+export function serializeObservations(groups: ObservationGroup[]): string {
+  if (!groups.length) return "";
+  return groups
+    .map((group) => {
+      const header = `Date: ${group.date}`;
+      const entries = group.entries
+        .map((entry) => {
+          const emoji =
+            entry.priority === "high"
+              ? "🔴"
+              : entry.priority === "medium"
+                ? "🟡"
+                : "🟢";
+          const line = `* ${emoji} (${entry.time}) ${entry.text}`;
+          if (entry.children?.length) {
+            const childLines = entry.children
+              .map((c) => `  * -> ${c.text}`)
+              .join("\n");
+            return `${line}\n${childLines}`;
+          }
+          return line;
+        })
+        .join("\n");
+      return `${header}\n${entries}`;
+    })
+    .join("\n\n");
 }
 
-function extractXmlBlock(text: string, tag: string): string | undefined {
-  const re = new RegExp(
-    `^[ \\t]*<${tag}>([\\s\\S]*?)^[ \\t]*<\\/${tag}>`,
-    "gim",
-  );
-  const matches = [...text.matchAll(re)];
-  if (matches.length === 0) return undefined;
-  return matches
-    .map((m) => m[1]?.trim() ?? "")
-    .filter(Boolean)
-    .join("\n");
-}
-
-function extractXmlTag(text: string, tag: string): string | undefined {
-  const re = new RegExp(
-    `^[ \\t]*<${tag}>([\\s\\S]*?)^[ \\t]*<\\/${tag}>`,
-    "im",
-  );
-  const m = text.match(re);
-  return m?.[1]?.trim() || undefined;
-}
-
-function extractListItems(text: string): string {
+/**
+ * Strips noise from serialized observations before injecting into the agent's
+ * context. The full structured data is stored on disk; this leaner text
+ * version saves tokens on every turn.
+ *
+ * - Removes 🟡 and 🟢 emojis (keeps 🔴 for critical items)
+ * - Removes arrow indicators (->)
+ * - Collapses extra whitespace
+ */
+export function optimizeForContext(groups: ObservationGroup[]): string {
+  const text = serializeObservations(groups);
+  if (!text) return "";
   return text
-    .split("\n")
-    .filter((l) => /^\s*[-*]\s/.test(l) || /^\s*\d+\.\s/.test(l))
-    .join("\n")
+    .replace(/🟡\s*/g, "")
+    .replace(/🟢\s*/g, "")
+    .replace(/\s*->\s*/g, " ")
+    .replace(/  +/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-const MAX_LINE_CHARS = 10_000;
-
-export function sanitizeLines(text: string): string {
-  if (!text) return text;
-  return text
-    .split("\n")
-    .map((l) =>
-      l.length > MAX_LINE_CHARS
-        ? l.slice(0, MAX_LINE_CHARS) + " … [truncated]"
-        : l,
-    )
-    .join("\n");
 }
 
 // ─── Degenerate output detection ─────────────────────────────────────────────
@@ -251,6 +318,9 @@ export function sanitizeLines(text: string): string {
 /**
  * Detects LLM repetition loops (a real failure mode with some models).
  * Samples ~50 windows of 200 chars; if >40% are duplicates, output is degenerate.
+ *
+ * With structured output this is less likely, but we run it on the serialized
+ * form as a safety net.
  */
 export function detectDegenerateRepetition(text: string): boolean {
   if (!text || text.length < 2_000) return false;
@@ -279,47 +349,59 @@ export function detectDegenerateRepetition(text: string): boolean {
   return false;
 }
 
-// ─── Context optimization ────────────────────────────────────────────────────
-
-/**
- * Strips noise from observations before injecting into the agent's context.
- * The full rich format is stored on disk; this leaner version saves tokens.
- * - Removes 🟡 and 🟢 emojis (keep 🔴 for critical items)
- * - Removes arrow indicators (->)
- * - Collapses extra whitespace
- */
-export function optimizeForContext(observations: string): string {
-  return observations
-    .replace(/🟡\s*/g, "")
-    .replace(/🟢\s*/g, "")
-    .replace(/\s*->\s*/g, " ")
-    .replace(/  +/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 // ─── Prompt builder ──────────────────────────────────────────────────────────
 
 /**
  * Builds the full user-turn prompt sent to the Observer.
- * Includes existing observations so the Observer doesn't repeat them.
+ * Includes existing observations (serialized to text) so the Observer doesn't
+ * repeat them.
  */
 export function buildObserverPrompt(
-  existingObservations: string | undefined,
+  existingObservations: ObservationGroup[] | undefined,
   messagesToObserve: WithParts[],
 ): string {
   const transcript = formatMessagesForObserver(messagesToObserve);
   let prompt = "";
 
-  if (existingObservations?.trim()) {
-    prompt += `## Previous Observations\n\n${existingObservations}\n\n---\n\n`;
+  if (existingObservations?.length) {
+    const serialized = serializeObservations(existingObservations);
+    prompt += `## Previous Observations\n\n${serialized}\n\n---\n\n`;
     prompt +=
       "Do not repeat these existing observations. Your new observations will be appended.\n\n";
   }
 
   prompt += `## New Message History to Observe\n\n${transcript}\n\n---\n\n`;
   prompt +=
-    "## Your Task\n\nExtract new observations from the message history above. Do not repeat observations already in the previous observations. Add your new observations in the format specified in your instructions.";
+    "## Your Task\n\nExtract new observations from the message history above. Do not repeat observations already in the previous observations. Output your structured observations using the StructuredOutput tool.";
 
   return prompt;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Merges two observation arrays, combining entries for the same date group.
+ */
+export function mergeObservationGroups(
+  existing: ObservationGroup[],
+  incoming: ObservationGroup[],
+): ObservationGroup[] {
+  // Build a map of date -> entries from existing
+  const byDate = new Map<string, ObservationEntry[]>();
+  for (const g of existing) {
+    byDate.set(g.date, [...(byDate.get(g.date) ?? []), ...g.entries]);
+  }
+  // Merge incoming
+  for (const g of incoming) {
+    byDate.set(g.date, [...(byDate.get(g.date) ?? []), ...g.entries]);
+  }
+  // Rebuild array preserving date order (existing first, then new dates)
+  const seenDates = new Set<string>();
+  const result: ObservationGroup[] = [];
+  for (const g of [...existing, ...incoming]) {
+    if (seenDates.has(g.date)) continue;
+    seenDates.add(g.date);
+    result.push({ date: g.date, entries: byDate.get(g.date) ?? [] });
+  }
+  return result;
 }

@@ -1,8 +1,8 @@
 import path from "path";
 import type { Hooks, PluginInput } from "@opencode-ai/plugin";
-import type { ObservationalMemoryConfig, SessionMemory } from "./types.js";
-import { readMemory, writeMemory, estimateTokens } from "./storage.js";
-import { optimizeForContext } from "./observer.js";
+import type { ObservationalMemoryConfig, SessionMemory, ObservationGroup } from "./types.js";
+import { readMemory, writeMemory, estimateTokens, estimateObservationTokens } from "./storage.js";
+import { optimizeForContext, mergeObservationGroups, serializeObservations } from "./observer.js";
 import {
   runObserver,
   runReflector,
@@ -28,11 +28,13 @@ const PREFETCH_FRACTION = 0.2;
  */
 const CONTINUATION_HINT = `This message is not from the user. The conversation history grew too long and the oldest messages have been compressed into your memory observations above.
 
-Please continue from where the observations left off. Do not refer to your "memory observations" directly — the user does not know about them, they are simply your memories. Just respond naturally as if you remember the conversation (you do!).
+Continue the conversation naturally. Your memory observations provide background context, but any messages that follow this reminder are the CURRENT state of the conversation and take priority.
+
+Do not refer to your "memory observations" directly — the user does not know about them, they are simply your memories. Just respond naturally as if you remember the conversation (you do!).
 
 Do not say "Hi there!" or "based on our previous conversation" as if the conversation is just starting — this is an ongoing conversation. Do not say "I understand. I've reviewed my memory observations" or "I remember [...]". Answer naturally.
 
-IMPORTANT: This system reminder is NOT from the user. The system placed it here as part of your memory system. Any messages following this reminder are newer than your memories.`;
+IMPORTANT: This system reminder is NOT from the user. The system placed it here as part of your memory system. Any messages following this reminder are newer than your memories and should be prioritized.`;
 
 /**
  * Cached result from a completed background Observer (and optional Reflector)
@@ -218,10 +220,11 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
             `[${sid}] Observer completed in ${(observerMs / 1000).toFixed(1)}s — ${result.observations.length} chars of new observations`,
           );
 
-          // Merge new observations with existing ones
-          const newObservations = currentMemory.observations
-            ? currentMemory.observations + "\n\n" + result.observations
-            : result.observations;
+          // Merge new observations with existing ones (both are structured arrays)
+          const newObservations = mergeObservationGroups(
+            currentMemory.observations,
+            result.observations,
+          );
 
           let newMemory: SessionMemory = {
             ...currentMemory,
@@ -235,7 +238,7 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
           };
 
           // Run Reflector in the same background pipeline if observations are too large
-          const obsTokens = estimateTokens(newObservations);
+          const obsTokens = estimateObservationTokens(newObservations);
           if (obsTokens >= reflectorThreshold) {
             log.info(
               `[${sid}] Reflector started — observations at ${fmtTokens(obsTokens)} exceed reflector threshold`,
@@ -250,7 +253,7 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
             const reflectorMs = performance.now() - t1;
 
             if (!reflected.degenerate && reflected.observations) {
-              const afterTokens = estimateTokens(reflected.observations);
+              const afterTokens = estimateObservationTokens(reflected.observations);
               newMemory = {
                 ...newMemory,
                 observations: reflected.observations,
@@ -381,41 +384,78 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
         // no LLM calls, no blocking.
         const completed = completedObservation.get(sessionID);
         if (completed && unobservedTokens >= observerThreshold) {
-          completedObservation.delete(sessionID);
+          // Guard: validate that cached indices still make sense.
+          // After native compaction the message array may be shorter than
+          // when the Observer was launched, making the splice invalid.
+          if (
+            completed.firstUnobservedIdx + completed.observedCount >
+            output.messages.length
+          ) {
+            log.warn(
+              `[${sid}] discarding stale observation — message array is shorter than expected ` +
+                `(need ${completed.firstUnobservedIdx + completed.observedCount}, have ${output.messages.length}). ` +
+                `Likely caused by native compaction.`,
+            );
+            completedObservation.delete(sessionID);
+            // Fall through to the background observer zone so a fresh run
+            // can be started with the current message array.
+          } else {
+            completedObservation.delete(sessionID);
 
-          // Persist the new memory state
-          await saveMemory(storageDir, sessionID, completed.memory);
+            // Detect messages that arrived AFTER the Observer's snapshot.
+            // These were never observed and their content is more recent than
+            // the Observer's currentTask / suggestedResponse.
+            const messagesAfterObserved =
+              output.messages.length -
+              (completed.firstUnobservedIdx + completed.observedCount);
+            const hasRecentMessages = messagesAfterObserved > 0;
 
-          // Drop observed messages from the context window
-          output.messages.splice(
-            completed.firstUnobservedIdx,
-            completed.observedCount,
-          );
+            if (hasRecentMessages) {
+              log.info(
+                `[${sid}] ${messagesAfterObserved} messages arrived after Observer snapshot — suppressing stale hints`,
+              );
+            }
 
-          // Inject continuation hint after the splice point
-          const hint = {
-            info: {
-              ...output.messages[completed.firstUnobservedIdx - 1]?.info,
-              role: "user" as const,
-              id: "om-continuation-hint",
-            },
-            parts: [
-              {
-                type: "text" as const,
-                text: buildContinuationMessage(completed.memory),
+            // Persist the new memory state
+            await saveMemory(storageDir, sessionID, completed.memory);
+
+            // Drop observed messages from the context window
+            output.messages.splice(
+              completed.firstUnobservedIdx,
+              completed.observedCount,
+            );
+
+            // Inject continuation hint after the splice point
+            const hint = {
+              info: {
+                ...output.messages[completed.firstUnobservedIdx - 1]?.info,
+                role: "user" as const,
+                id: "om-continuation-hint",
               },
-            ],
-          };
-          output.messages.splice(
-            completed.firstUnobservedIdx,
-            0,
-            hint as (typeof output.messages)[number],
-          );
+              parts: [
+                {
+                  type: "text" as const,
+                  text: buildContinuationMessage(
+                    completed.memory,
+                    hasRecentMessages,
+                  ),
+                },
+              ],
+            };
+            output.messages.splice(
+              completed.firstUnobservedIdx,
+              0,
+              hint as (typeof output.messages)[number],
+            );
 
-          log.info(
-            `[${sid}] applied observations — dropped ${completed.observedCount} msgs, ${output.messages.length} remaining`,
-          );
-          return;
+            log.info(
+              `[${sid}] applied observations — dropped ${completed.observedCount} msgs, ${output.messages.length} remaining` +
+                (hasRecentMessages
+                  ? ` (${messagesAfterObserved} recent msgs preserved)`
+                  : ""),
+            );
+            return;
+          }
         }
 
         // ── Background Observer zone ────────────────────────────────────────
@@ -500,16 +540,48 @@ function estimateMessageTokens(
 
 /**
  * Builds the continuation hint message injected after observed messages are dropped.
- * Includes the current task and suggested response from the Observer if available.
+ *
+ * When `hasRecentMessages` is false (the Observer saw everything up to the current
+ * turn), the hint includes the full currentTask and suggestedResponse — these are
+ * fresh and help the LLM pick up exactly where it left off.
+ *
+ * When `hasRecentMessages` is true, new user/assistant messages arrived between
+ * the Observer snapshot and the apply point. In that case:
+ * - suggestedResponse is dropped entirely (it would tell the LLM to do
+ *   something that no longer matches the conversation state)
+ * - currentTask is included as background context but explicitly marked as
+ *   potentially outdated
+ * - An extra directive tells the LLM to prioritize the recent messages
  */
-function buildContinuationMessage(memory: SessionMemory): string {
+function buildContinuationMessage(
+  memory: SessionMemory,
+  hasRecentMessages: boolean,
+): string {
   const parts = [`<system-reminder>\n${CONTINUATION_HINT}`];
 
-  if (memory.currentTask) {
-    parts.push(`\n\nCurrent task:\n${memory.currentTask}`);
-  }
-  if (memory.suggestedResponse) {
-    parts.push(`\n\nSuggested next response:\n${memory.suggestedResponse}`);
+  if (hasRecentMessages) {
+    // Recent messages exist that the Observer never saw.
+    // The LLM MUST prioritize those over the stale hints.
+    parts.push(
+      `\n\nIMPORTANT: Messages follow this reminder that occurred AFTER your memories were captured. ` +
+        `These messages represent the CURRENT state of the conversation. ` +
+        `Prioritize them over your memory observations when determining what the user needs right now.`,
+    );
+    if (memory.currentTask) {
+      parts.push(
+        `\n\nPrevious task context (may have changed — check recent messages):\n${memory.currentTask}`,
+      );
+    }
+    // Deliberately omit suggestedResponse — it would directly mislead the LLM
+    // about what to say next when the conversation has moved on.
+  } else {
+    // Observer saw everything — hints are fresh, include them fully.
+    if (memory.currentTask) {
+      parts.push(`\n\nCurrent task:\n${memory.currentTask}`);
+    }
+    if (memory.suggestedResponse) {
+      parts.push(`\n\nSuggested next response:\n${memory.suggestedResponse}`);
+    }
   }
 
   parts.push("\n</system-reminder>");

@@ -1,4 +1,8 @@
-import { detectDegenerateRepetition, sanitizeLines } from "./observer.js";
+import type { ObservationGroup } from "./types.js";
+import {
+  serializeObservations,
+  detectDegenerateRepetition,
+} from "./observer.js";
 
 // ─── Prompts ────────────────────────────────────────────────────────────────
 
@@ -26,153 +30,86 @@ User assertions are the source of truth. A later question does not invalidate a 
 
 === OUTPUT FORMAT ===
 
-Your output MUST use XML tags:
+You will output structured data via the StructuredOutput tool. The structure is:
+- "observations": array of date groups, each with a "date" string and "entries" array
+- Each entry has: "priority" (high/medium/low), "time" (24h format), "text", optional "children" array
+- "suggestedResponse": hint for the agent's immediate next message after reflection
 
-<observations>
-Put all consolidated observations here using the date-grouped format with priority emojis (🔴, 🟡, 🟢).
-Group related observations with indentation.
-</observations>
+Priority levels when re-assigning:
+- "high": explicit user facts, preferences, goals achieved, critical context that will be lost if dropped
+- "medium": project details, learned information, tool results, sequences
+- "low": minor details, uncertain observations, things that can be reconstructed
 
-<current-task>
-State the current task(s) explicitly:
-- Primary: What the agent is currently working on
-- Secondary: Other pending tasks (mark as "waiting for user" if appropriate)
-</current-task>
+=== CRITICAL RULES ===
 
-<suggested-response>
-Hint for the agent's immediate next message. Examples:
-- "I've updated the navigation model. Let me walk you through the changes..."
-- "The assistant should wait for the user to respond before continuing."
-- Call the view tool on src/example.ts to continue debugging.
-</suggested-response>
+1. NEVER drop high-priority entries. If you're unsure, mark as high.
+2. NEVER invent information. Only reflect/reorganize what was observed.
+3. NEVER assume future context. Write as if this is the final memory.
+4. Respect the temporal order. Recent observations should be more detailed.
+5. If you're condensing multiple old observations into one, preserve key dates/times in the new text.
 
-User messages are extremely important. If the user asks a question or gives a new task, make it clear in <current-task> that this is the priority.${instruction ? `\n\n=== CUSTOM INSTRUCTIONS ===\n\n${instruction}` : ""}`;
+Remember: Your output IS the assistant's memory going forward. Everything not here will be forgotten.${instruction ? `
+
+=== CUSTOM INSTRUCTIONS ===
+
+${instruction}` : ""}`;
 }
 
-// ─── Compression guidance ────────────────────────────────────────────────────
+// ─── Prompt builder ──────────────────────────────────────────────────────────
 
 /**
- * Escalating compression prompts appended when the Reflector's output is too large.
- * Level 0 = no guidance (first attempt). Levels 1-3 push progressively harder.
- */
-const COMPRESSION_GUIDANCE: Record<0 | 1 | 2 | 3, string> = {
-  0: "",
-  1: `
-## COMPRESSION REQUIRED
-
-Your previous reflection was the same size or larger than the original observations.
-
-Please re-process with slightly more compression:
-- Condense older observations into higher-level reflections
-- Closer to the end, retain more fine details (recent context matters more)
-- Combine related items more aggressively but do not lose important specifics (names, places, events)
-- If there are long nested lists about repeated tool calls, combine into a single line with outcome
-
-Your current detail level was a 10/10, aim for a 8/10.
-`,
-  2: `
-## AGGRESSIVE COMPRESSION REQUIRED
-
-Your previous reflection was still too large after compression guidance.
-
-Please re-process with much more aggressive compression:
-- Heavily condense older observations into high-level summaries
-- Closer to the end, retain fine details (recent context matters more)
-- Combine related items aggressively but do not lose important specifics
-- Remove redundant information and merge overlapping observations
-
-Your current detail level was a 10/10, aim for a 6/10.
-`,
-  3: `
-## CRITICAL COMPRESSION REQUIRED
-
-Multiple compression attempts have failed to reduce sufficiently.
-
-Please re-process with maximum compression:
-- Summarize the oldest observations (first 50-70%) into brief high-level paragraphs — only key facts, decisions, and outcomes
-- For the most recent observations (last 30-50%), retain important details but use a condensed style
-- Ruthlessly merge related observations — if 10 observations are about the same topic, combine into 1-2 lines
-- Drop procedural details (tool calls, retries, intermediate steps) — keep only final outcomes
-- Preserve: names, dates, decisions, errors, user preferences, architectural choices
-
-Your current detail level was a 10/10, aim for a 4/10.
-`,
-};
-
-/**
- * Builds the user-turn prompt sent to the Reflector.
+ * Builds the full user-turn prompt sent to the Reflector.
+ * Includes existing observations formatted for readability.
  */
 export function buildReflectorPrompt(
-  observations: string,
-  compressionLevel: 0 | 1 | 2 | 3 = 0,
-  manualPrompt?: string,
+  observations: ObservationGroup[],
 ): string {
-  let prompt = `## OBSERVATIONS TO REFLECT ON
+  const serialized = serializeObservations(observations);
+  return `## Current Observations
 
-${observations}
+${serialized}
 
 ---
 
-Please analyze these observations and produce a refined, condensed version that will become the assistant's entire memory going forward.`;
+## Your Task
 
-  if (manualPrompt) {
-    prompt += `\n\n## SPECIFIC GUIDANCE\n\n${manualPrompt}`;
-  }
-
-  const guidance = COMPRESSION_GUIDANCE[compressionLevel];
-  if (guidance) prompt += `\n\n${guidance}`;
-
-  return prompt;
+Reflect on these observations. Re-organize, streamline, and condense where possible while preserving critical information. Draw connections and conclusions. Output your consolidated observations using the StructuredOutput tool.`;
 }
 
-// ─── Output parser ───────────────────────────────────────────────────────────
-
-export type ParsedReflector = {
-  observations: string;
-  suggestedResponse?: string;
-  degenerate?: boolean;
-};
+// ─── Token estimation ───────────────────────────────────────────────────────
 
 /**
- * Parses the Reflector's XML-structured output.
+ * Estimates token count of observations for reflector threshold checking.
+ * Uses the 4-chars-per-token heuristic (same as storage.ts for consistency).
  */
-export function parseReflectorOutput(raw: string): ParsedReflector {
-  if (detectDegenerateRepetition(raw)) {
-    return { observations: "", degenerate: true };
-  }
-
-  const obsMatch = raw.match(
-    /^[ \t]*<observations>([\s\S]*?)^[ \t]*<\/observations>/im,
-  );
-  const suggestedMatch = raw.match(
-    /^[ \t]*<suggested-response>([\s\S]*?)^[ \t]*<\/suggested-response>/im,
-  );
-
-  const rawObs = obsMatch?.[1]?.trim() ?? extractListItems(raw);
-  const observations = sanitizeLines(rawObs);
-  const suggestedResponse = suggestedMatch?.[1]?.trim() || undefined;
-
-  return { observations, suggestedResponse };
+export function estimateObservationTokens(
+  groups: ObservationGroup[],
+): number {
+  const text = serializeObservations(groups);
+  return Math.ceil(text.length / 4);
 }
 
-function extractListItems(text: string): string {
-  return text
-    .split("\n")
-    .filter((l) => /^\s*[-*]\s/.test(l) || /^\s*\d+\.\s/.test(l))
-    .join("\n")
-    .trim();
-}
+// ─── Degenerate output check ────────────────────────────────────────────────
 
 /**
- * Validates that reflection actually compressed the observations.
- * Returns true if the reflected output is smaller than the input.
+ * Validates Reflector output. Flags issues without hard failing.
+ *
+ * Returns a "degenerate" flag if:
+ * - Output is suspiciously repetitive (likely LLM loop)
+ * - No observations remain (total loss of memory)
+ * - Structure is malformed (unlikely with structured output)
  */
-export function validateCompression(
-  reflectedTokens: number,
-  inputTokens: number,
-): boolean {
-  return reflectedTokens < inputTokens;
-}
+export function validateReflectorOutput(
+  groups: ObservationGroup[],
+): { valid: boolean; degenerate?: boolean } {
+  if (!groups?.length) {
+    return { valid: false, degenerate: true }; // Reflector erased memory
+  }
 
-// Re-export sanitizeLines for use in observer.ts (avoids circular dep)
-export { sanitizeLines } from "./observer.js";
+  const serialized = serializeObservations(groups);
+  if (detectDegenerateRepetition(serialized)) {
+    return { valid: false, degenerate: true };
+  }
+
+  return { valid: true };
+}

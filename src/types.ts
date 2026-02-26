@@ -1,27 +1,59 @@
+// ─── Structured observation types ────────────────────────────────────────────
+
+/**
+ * A single observation entry — one bullet point in the observation log.
+ *
+ * Examples:
+ *   { priority: "high", time: "14:30", text: "User decided to use Bun runtime" }
+ *   { priority: "medium", time: "14:32", text: "Agent browsed auth source files",
+ *     children: [{ text: "viewed src/auth.ts — found token validation logic" }] }
+ */
+export type ObservationEntry = {
+  priority: "high" | "medium" | "low";
+  time: string;
+  text: string;
+  children?: { text: string }[];
+};
+
+/**
+ * A group of observations under a single date header.
+ *
+ * Example:
+ *   { date: "Dec 4, 2025", entries: [ ... ] }
+ */
+export type ObservationGroup = {
+  date: string;
+  entries: ObservationEntry[];
+};
+
+// ─── Session memory ──────────────────────────────────────────────────────────
+
 /**
  * Persisted state for a single opencode session.
  *
- * observations: raw markdown string in the Mastra XML format, accumulated over
- * the session. Stored as a string (not structured) because the Observer/Reflector
- * produce and consume prose markdown, not JSON arrays.
+ * observations: structured array of date-grouped observation entries,
+ * accumulated by the Observer and condensed by the Reflector.
  *
- * suggestedResponse: last <suggested-response> extracted from the Observer. Injected
- * as a hint after the continuation reminder so the agent picks up naturally.
+ * suggestedResponse: last suggested-response extracted from the Observer.
+ * Injected as a hint after the continuation reminder so the agent picks up
+ * naturally.
  *
- * currentTask: last <current-task> extracted from the Observer. Injected alongside
- * suggestedResponse for continuity after message history is truncated.
+ * currentTask: last current-task extracted from the Observer. Injected
+ * alongside suggestedResponse for continuity after message history is
+ * truncated.
  *
- * lastObservedMessageIndex: index into the message array at which the last observation
- * run completed. Messages at and below this index are "observed" and may be dropped.
+ * lastObservedMessageIndex: index into the message array at which the last
+ * observation run completed. Messages at and below this index are "observed"
+ * and may be dropped.
  *
- * lastObservedTokens: estimated input token count at the time of the last Observer run.
- * Used to compute the delta since last observation.
+ * lastObservedTokens: estimated input token count at the time of the last
+ * Observer run. Used to compute the delta since last observation.
  *
  * lastObservedAt: unix ms timestamp of the last Observer run.
  * lastReflectedAt: unix ms timestamp of the last Reflector run.
  */
 export type SessionMemory = {
-  observations: string;
+  observations: ObservationGroup[];
   suggestedResponse?: string;
   currentTask?: string;
   lastObservedMessageIndex: number;
@@ -50,7 +82,7 @@ export type ObservationalMemoryConfig = {
 
   /**
    * The AI model to use for Observer and Reflector agents.
-   * Format: "providerID:modelID", e.g. "anthropic:claude-haiku-3-5"
+   * Format: "providerID/modelID", e.g. "anthropic/claude-haiku-4-5-20251001"
    * Default: inherits the session's current model.
    */
   model?: string;
@@ -88,7 +120,7 @@ export type ObservationalMemoryConfig = {
 
 /** Result from the Observer agent call */
 export type ObserverResult = {
-  observations: string;
+  observations: ObservationGroup[];
   currentTask?: string;
   suggestedResponse?: string;
   degenerate?: boolean;
@@ -96,7 +128,7 @@ export type ObserverResult = {
 
 /** Result from the Reflector agent call */
 export type ReflectorResult = {
-  observations: string;
+  observations: ObservationGroup[];
   suggestedResponse?: string;
   degenerate?: boolean;
 };

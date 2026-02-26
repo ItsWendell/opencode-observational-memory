@@ -1,9 +1,10 @@
 import path from "path";
 import fs from "fs/promises";
-import type { SessionMemory } from "./types.js";
+import type { SessionMemory, ObservationGroup } from "./types.js";
+import { serializeObservations } from "./observer.js";
 
 const DEFAULT_MEMORY: SessionMemory = {
-  observations: "",
+  observations: [],
   lastObservedMessageIndex: -1,
   lastObservedTokens: 0,
   lastObservedAt: 0,
@@ -13,6 +14,9 @@ const DEFAULT_MEMORY: SessionMemory = {
 /**
  * Reads the persisted memory for a session from disk.
  * Returns a fresh default if no file exists yet.
+ * 
+ * Handles migration: if observations is a string (legacy format),
+ * it's treated as empty for structured output mode.
  */
 export async function readMemory(
   storageDir: string,
@@ -21,7 +25,20 @@ export async function readMemory(
   const file = memoryPath(storageDir, sessionID);
   try {
     const raw = await fs.readFile(file, "utf-8");
-    return JSON.parse(raw) as SessionMemory;
+    const data = JSON.parse(raw) as SessionMemory;
+    
+    // Migration: if observations is still a string, convert to empty array
+    if (typeof data.observations === "string") {
+      console.warn(
+        `[observational-memory] Migrating legacy string observations for session ${sessionID}`
+      );
+      return {
+        ...data,
+        observations: [],
+      };
+    }
+    
+    return data;
   } catch {
     return { ...DEFAULT_MEMORY };
   }
@@ -50,6 +67,17 @@ export async function writeMemory(
  */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/**
+ * Estimates the token count of structured observation groups.
+ * Serializes to text and applies the 4-chars-per-token heuristic.
+ */
+export function estimateObservationTokens(
+  groups: ObservationGroup[],
+): number {
+  const text = serializeObservations(groups);
+  return estimateTokens(text);
 }
 
 function memoryPath(storageDir: string, sessionID: string) {
