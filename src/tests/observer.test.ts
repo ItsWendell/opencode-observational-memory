@@ -1,11 +1,13 @@
 import { describe, it, expect } from "bun:test";
 import {
-  parseObserverOutput,
   detectDegenerateRepetition,
   optimizeForContext,
   formatMessagesForObserver,
   buildObserverPrompt,
+  serializeObservations,
+  mergeObservationGroups,
 } from "../observer.js";
+import type { ObservationGroup } from "../types.js";
 
 // ─── Minimal message fixture ─────────────────────────────────────────────────
 
@@ -51,72 +53,153 @@ function makeToolMsg(tool: string, input: unknown, output: string) {
   } as Parameters<typeof formatMessagesForObserver>[0][number];
 }
 
-// ─── parseObserverOutput tests ───────────────────────────────────────────────
+// ─── Mock observation data ───────────────────────────────────────────────────
 
-describe("parseObserverOutput", () => {
-  it("extracts observations from XML block", () => {
-    const raw = `
-<observations>
-Date: Jan 1, 2026
-* 🔴 (14:30) User decided to use Bun runtime.
-* 🟡 (14:31) Created src/index.ts.
-</observations>
-<current-task>
-Implement main entry point
-</current-task>
-<suggested-response>
-Continue with index.ts
-</suggested-response>
-`;
-    const result = parseObserverOutput(raw);
-    expect(result.observations).toContain("User decided to use Bun runtime");
-    expect(result.observations).toContain("Created src/index.ts");
-    expect(result.currentTask).toBe("Implement main entry point");
-    expect(result.suggestedResponse).toBe("Continue with index.ts");
+const MOCK_GROUPS: ObservationGroup[] = [
+  {
+    date: "Jan 1, 2026",
+    entries: [
+      {
+        priority: "high",
+        time: "14:30",
+        text: "User decided to use Bun runtime",
+      },
+      {
+        priority: "medium",
+        time: "14:31",
+        text: "Created src/index.ts with main function",
+      },
+    ],
+  },
+];
+
+const MOCK_GROUPS_WITH_CHILDREN: ObservationGroup[] = [
+  {
+    date: "Jan 1, 2026",
+    entries: [
+      {
+        priority: "medium",
+        time: "14:32",
+        text: "Agent browsed auth source files",
+        children: [
+          { text: "viewed src/auth.ts — found token validation logic" },
+          { text: "viewed src/users.ts — found user lookup by email" },
+        ],
+      },
+    ],
+  },
+];
+
+// ─── serializeObservations tests ─────────────────────────────────────────────
+
+describe("serializeObservations", () => {
+  it("returns empty string for empty array", () => {
+    expect(serializeObservations([])).toBe("");
   });
 
-  it("falls back to list items when XML tags absent", () => {
-    const raw =
-      "* 🔴 (09:00) User prefers TypeScript\n* 🟡 (09:01) Set up tsconfig";
-    const result = parseObserverOutput(raw);
-    expect(result.observations).toContain("User prefers TypeScript");
-    expect(result.observations).toContain("tsconfig");
-    expect(result.currentTask).toBeUndefined();
-    expect(result.suggestedResponse).toBeUndefined();
+  it("serializes basic observations with priority emojis", () => {
+    const result = serializeObservations(MOCK_GROUPS);
+    expect(result).toContain("Date: Jan 1, 2026");
+    expect(result).toContain("🔴 (14:30) User decided to use Bun runtime");
+    expect(result).toContain("🟡 (14:31) Created src/index.ts");
   });
 
-  it("returns empty when no recognizable content", () => {
-    const result = parseObserverOutput("I cannot extract anything useful.");
-    expect(result.observations).toBe("");
+  it("serializes children with arrow indicators", () => {
+    const result = serializeObservations(MOCK_GROUPS_WITH_CHILDREN);
+    expect(result).toContain("Agent browsed auth source files");
+    expect(result).toContain("  * -> viewed src/auth.ts");
+    expect(result).toContain("  * -> viewed src/users.ts");
   });
 
-  it("handles multiple observation blocks by joining them", () => {
-    const raw = `
-<observations>
-Date: Jan 1, 2026
-* 🔴 (09:00) First block
-</observations>
-Some text in between
-<observations>
-Date: Jan 2, 2026
-* 🔴 (10:00) Second block
-</observations>
-`;
-    const result = parseObserverOutput(raw);
-    expect(result.observations).toContain("First block");
-    expect(result.observations).toContain("Second block");
+  it("serializes low priority with green emoji", () => {
+    const groups: ObservationGroup[] = [
+      {
+        date: "Jan 1, 2026",
+        entries: [{ priority: "low", time: "09:00", text: "Minor detail" }],
+      },
+    ];
+    const result = serializeObservations(groups);
+    expect(result).toContain("🟢 (09:00) Minor detail");
+  });
+});
+
+// ─── optimizeForContext tests ─────────────────────────────────────────────────
+
+describe("optimizeForContext", () => {
+  it("removes 🟡 and 🟢 but keeps 🔴", () => {
+    const groups: ObservationGroup[] = [
+      {
+        date: "Jan 1, 2026",
+        entries: [
+          { priority: "high", time: "09:00", text: "Critical" },
+          { priority: "medium", time: "09:01", text: "Medium" },
+          { priority: "low", time: "09:02", text: "Low" },
+        ],
+      },
+    ];
+    const result = optimizeForContext(groups);
+    expect(result).toContain("🔴");
+    expect(result).not.toContain("🟡");
+    expect(result).not.toContain("🟢");
   });
 
-  it("truncates lines exceeding 10k chars", () => {
-    const longLine = "* 🔴 (09:00) " + "x".repeat(11_000);
-    const raw = `<observations>\n${longLine}\n</observations>`;
-    const result = parseObserverOutput(raw);
-    const line = result.observations
-      .split("\n")
-      .find((l) => l.startsWith("* 🔴"));
-    expect(line).toBeDefined();
-    expect(line!.length).toBeLessThan(11_000);
-    expect(line).toContain("[truncated]");
+  it("replaces arrow indicators with spaces", () => {
+    const result = optimizeForContext(MOCK_GROUPS_WITH_CHILDREN);
+    expect(result).not.toContain("->");
+    expect(result).toContain("viewed src/auth.ts");
+  });
+
+  it("returns empty string for empty observations", () => {
+    expect(optimizeForContext([])).toBe("");
+  });
+});
+
+// ─── mergeObservationGroups tests ────────────────────────────────────────────
+
+describe("mergeObservationGroups", () => {
+  it("merges entries from the same date", () => {
+    const a: ObservationGroup[] = [
+      {
+        date: "Jan 1, 2026",
+        entries: [{ priority: "high", time: "09:00", text: "First" }],
+      },
+    ];
+    const b: ObservationGroup[] = [
+      {
+        date: "Jan 1, 2026",
+        entries: [{ priority: "high", time: "10:00", text: "Second" }],
+      },
+    ];
+    const merged = mergeObservationGroups(a, b);
+    expect(merged.length).toBe(1);
+    expect(merged[0].entries.length).toBe(2);
+    expect(merged[0].entries[0].text).toBe("First");
+    expect(merged[0].entries[1].text).toBe("Second");
+  });
+
+  it("preserves separate dates", () => {
+    const a: ObservationGroup[] = [
+      {
+        date: "Jan 1, 2026",
+        entries: [{ priority: "high", time: "09:00", text: "Day 1" }],
+      },
+    ];
+    const b: ObservationGroup[] = [
+      {
+        date: "Jan 2, 2026",
+        entries: [{ priority: "high", time: "09:00", text: "Day 2" }],
+      },
+    ];
+    const merged = mergeObservationGroups(a, b);
+    expect(merged.length).toBe(2);
+    expect(merged[0].date).toBe("Jan 1, 2026");
+    expect(merged[1].date).toBe("Jan 2, 2026");
+  });
+
+  it("handles empty arrays", () => {
+    expect(mergeObservationGroups([], []).length).toBe(0);
+    expect(mergeObservationGroups(MOCK_GROUPS, []).length).toBe(1);
+    expect(mergeObservationGroups([], MOCK_GROUPS).length).toBe(1);
   });
 });
 
@@ -142,7 +225,6 @@ describe("detectDegenerateRepetition", () => {
   });
 
   it("detects repetition loops", () => {
-    // A classic LLM repetition loop: same 200-char chunk over and over
     const repeated = "* 🔴 (09:00) User wants something. ".repeat(200);
     expect(detectDegenerateRepetition(repeated)).toBe(true);
   });
@@ -150,36 +232,6 @@ describe("detectDegenerateRepetition", () => {
   it("detects single extremely long lines", () => {
     const giant = "x".repeat(55_000);
     expect(detectDegenerateRepetition(giant)).toBe(true);
-  });
-});
-
-// ─── optimizeForContext tests ─────────────────────────────────────────────────
-
-describe("optimizeForContext", () => {
-  it("removes 🟡 and 🟢 but keeps 🔴", () => {
-    const obs = "* 🔴 (09:00) Critical\n* 🟡 (09:01) Medium\n* 🟢 (09:02) Low";
-    const result = optimizeForContext(obs);
-    expect(result).toContain("🔴");
-    expect(result).not.toContain("🟡");
-    expect(result).not.toContain("🟢");
-  });
-
-  it("replaces arrow indicators with spaces", () => {
-    const obs =
-      "* 🔴 (09:00) Agent browsed files\n  * -> viewed auth.ts — found logic";
-    const result = optimizeForContext(obs);
-    expect(result).not.toContain("->");
-    expect(result).toContain("viewed auth.ts");
-  });
-
-  it("collapses multiple blank lines", () => {
-    const obs = "line1\n\n\n\nline2";
-    const result = optimizeForContext(obs);
-    expect(result).toBe("line1\n\nline2");
-  });
-
-  it("trims leading and trailing whitespace", () => {
-    expect(optimizeForContext("  hello  ")).toBe("hello");
   });
 });
 
@@ -209,7 +261,6 @@ describe("formatMessagesForObserver", () => {
   it("includes timestamp in header", () => {
     const ts = new Date("2026-01-15T14:30:00Z").getTime();
     const result = formatMessagesForObserver([makeMsg("user", "hi", ts)]);
-    // Should contain some time indication
     expect(result).toContain("**User (");
   });
 
@@ -260,15 +311,21 @@ describe("buildObserverPrompt", () => {
   });
 
   it("includes existing observations when provided", () => {
-    const existing = "Date: Jan 1, 2026\n* 🔴 (09:00) Previous observation";
-    const prompt = buildObserverPrompt(existing, [makeMsg("user", "continue")]);
+    const prompt = buildObserverPrompt(MOCK_GROUPS, [
+      makeMsg("user", "continue"),
+    ]);
     expect(prompt).toContain("Previous Observations");
-    expect(prompt).toContain("Previous observation");
+    expect(prompt).toContain("User decided to use Bun runtime");
     expect(prompt).toContain("Do not repeat these existing observations");
   });
 
   it("omits previous observations section when undefined", () => {
     const prompt = buildObserverPrompt(undefined, [makeMsg("user", "start")]);
+    expect(prompt).not.toContain("Previous Observations");
+  });
+
+  it("omits previous observations section when empty array", () => {
+    const prompt = buildObserverPrompt([], [makeMsg("user", "start")]);
     expect(prompt).not.toContain("Previous Observations");
   });
 });
