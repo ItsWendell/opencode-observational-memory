@@ -1,8 +1,5 @@
 import type { ObservationGroup } from "./types.js";
-import {
-  serializeObservations,
-  detectDegenerateRepetition,
-} from "./observer.js";
+import { serializeObservations, detectDegenerateRepetition } from "./observer.js";
 
 // ─── Prompts ────────────────────────────────────────────────────────────────
 
@@ -33,83 +30,104 @@ User assertions are the source of truth. A later question does not invalidate a 
 You will output structured data via the StructuredOutput tool. The structure is:
 - "observations": array of date groups, each with a "date" string and "entries" array
 - Each entry has: "priority" (high/medium/low), "time" (24h format), "text", optional "children" array
-- "suggestedResponse": hint for the agent's immediate next message after reflection
+- "suggestedResponse": updated hint for the agent's immediate next message
 
-Priority levels when re-assigning:
-- "high": explicit user facts, preferences, goals achieved, critical context that will be lost if dropped
-- "medium": project details, learned information, tool results, sequences
-- "low": minor details, uncertain observations, things that can be reconstructed
+Priority levels:
+- "high": explicit user facts, preferences, goals achieved, critical context
+- "medium": project details, learned information, tool results
+- "low": minor details, uncertain observations
 
-=== CRITICAL RULES ===
+Use the "children" array to group related sub-observations under a parent entry.
 
-1. NEVER drop high-priority entries. If you're unsure, mark as high.
-2. NEVER invent information. Only reflect/reorganize what was observed.
-3. NEVER assume future context. Write as if this is the final memory.
-4. Respect the temporal order. Recent observations should be more detailed.
-5. If you're condensing multiple old observations into one, preserve key dates/times in the new text.
-
-Remember: Your output IS the assistant's memory going forward. Everything not here will be forgotten.${instruction ? `
-
-=== CUSTOM INSTRUCTIONS ===
-
-${instruction}` : ""}`;
+User messages are extremely important. If the user asks a question or gives a new task, make it clear that this is the priority.${instruction ? `\n\n=== CUSTOM INSTRUCTIONS ===\n\n${instruction}` : ""}`;
 }
 
-// ─── Prompt builder ──────────────────────────────────────────────────────────
+// ─── Compression guidance ────────────────────────────────────────────────────
 
 /**
- * Builds the full user-turn prompt sent to the Reflector.
- * Includes existing observations formatted for readability.
+ * Escalating compression prompts appended when the Reflector's output is too large.
+ * Level 0 = no guidance (first attempt). Levels 1-3 push progressively harder.
+ */
+const COMPRESSION_GUIDANCE: Record<0 | 1 | 2 | 3, string> = {
+  0: "",
+  1: `
+## COMPRESSION REQUIRED
+
+Your previous reflection was the same size or larger than the original observations.
+
+Please re-process with slightly more compression:
+- Condense older observations into higher-level reflections
+- Closer to the end, retain more fine details (recent context matters more)
+- Combine related items more aggressively but do not lose important specifics (names, places, events)
+- If there are long nested lists about repeated tool calls, combine into a single entry with outcome
+
+Your current detail level was a 10/10, aim for a 8/10.
+`,
+  2: `
+## AGGRESSIVE COMPRESSION REQUIRED
+
+Your previous reflection was still too large after compression guidance.
+
+Please re-process with much more aggressive compression:
+- Heavily condense older observations into high-level summaries
+- Closer to the end, retain fine details (recent context matters more)
+- Combine related items aggressively but do not lose important specifics
+- Remove redundant information and merge overlapping observations
+
+Your current detail level was a 10/10, aim for a 6/10.
+`,
+  3: `
+## CRITICAL COMPRESSION REQUIRED
+
+Multiple compression attempts have failed to reduce sufficiently.
+
+Please re-process with maximum compression:
+- Summarize the oldest observations (first 50-70%) into brief high-level entries — only key facts, decisions, and outcomes
+- For the most recent observations (last 30-50%), retain important details but use a condensed style
+- Ruthlessly merge related observations — if 10 observations are about the same topic, combine into 1-2 entries
+- Drop procedural details (tool calls, retries, intermediate steps) — keep only final outcomes
+- Preserve: names, dates, decisions, errors, user preferences, architectural choices
+
+Your current detail level was a 10/10, aim for a 4/10.
+`,
+};
+
+/**
+ * Builds the user-turn prompt sent to the Reflector.
+ * Serializes structured observations to text so the LLM can read them.
  */
 export function buildReflectorPrompt(
   observations: ObservationGroup[],
+  compressionLevel: 0 | 1 | 2 | 3 = 0,
+  manualPrompt?: string,
 ): string {
   const serialized = serializeObservations(observations);
-  return `## Current Observations
+
+  let prompt = `## OBSERVATIONS TO REFLECT ON
 
 ${serialized}
 
 ---
 
-## Your Task
+Please analyze these observations and produce a refined, condensed version that will become the assistant's entire memory going forward. Output your structured observations using the StructuredOutput tool.`;
 
-Reflect on these observations. Re-organize, streamline, and condense where possible while preserving critical information. Draw connections and conclusions. Output your consolidated observations using the StructuredOutput tool.`;
-}
-
-// ─── Token estimation ───────────────────────────────────────────────────────
-
-/**
- * Estimates token count of observations for reflector threshold checking.
- * Uses the 4-chars-per-token heuristic (same as storage.ts for consistency).
- */
-export function estimateObservationTokens(
-  groups: ObservationGroup[],
-): number {
-  const text = serializeObservations(groups);
-  return Math.ceil(text.length / 4);
-}
-
-// ─── Degenerate output check ────────────────────────────────────────────────
-
-/**
- * Validates Reflector output. Flags issues without hard failing.
- *
- * Returns a "degenerate" flag if:
- * - Output is suspiciously repetitive (likely LLM loop)
- * - No observations remain (total loss of memory)
- * - Structure is malformed (unlikely with structured output)
- */
-export function validateReflectorOutput(
-  groups: ObservationGroup[],
-): { valid: boolean; degenerate?: boolean } {
-  if (!groups?.length) {
-    return { valid: false, degenerate: true }; // Reflector erased memory
+  if (manualPrompt) {
+    prompt += `\n\n## SPECIFIC GUIDANCE\n\n${manualPrompt}`;
   }
 
-  const serialized = serializeObservations(groups);
-  if (detectDegenerateRepetition(serialized)) {
-    return { valid: false, degenerate: true };
-  }
+  const guidance = COMPRESSION_GUIDANCE[compressionLevel];
+  if (guidance) prompt += `\n\n${guidance}`;
 
-  return { valid: true };
+  return prompt;
+}
+
+/**
+ * Validates that reflection actually compressed the observations.
+ * Returns true if the reflected output is smaller than the input.
+ */
+export function validateCompression(
+  reflectedTokens: number,
+  inputTokens: number,
+): boolean {
+  return reflectedTokens < inputTokens;
 }

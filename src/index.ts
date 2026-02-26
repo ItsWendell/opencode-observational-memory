@@ -1,7 +1,7 @@
 import path from "path";
 import type { Hooks, PluginInput } from "@opencode-ai/plugin";
-import type { ObservationalMemoryConfig, SessionMemory, ObservationGroup } from "./types.js";
-import { readMemory, writeMemory, estimateTokens, estimateObservationTokens } from "./storage.js";
+import type { ObservationalMemoryConfig, SessionMemory } from "./types.js";
+import { readMemory, writeMemory, estimateObservationTokens } from "./storage.js";
 import { optimizeForContext, mergeObservationGroups, serializeObservations } from "./observer.js";
 import {
   runObserver,
@@ -204,12 +204,14 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
           const result = await runObserver(
             agentInput,
             unobserved,
-            currentMemory.observations || undefined,
+            currentMemory.observations.length
+              ? currentMemory.observations
+              : undefined,
             config.observerInstruction,
           );
           const observerMs = performance.now() - t0;
 
-          if (result.degenerate || !result.observations) {
+          if (result.degenerate || !result.observations.length) {
             log.warn(
               `[${sid}] Observer returned ${result.degenerate ? "degenerate" : "empty"} output after ${(observerMs / 1000).toFixed(1)}s — skipping`,
             );
@@ -217,7 +219,7 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
           }
 
           log.info(
-            `[${sid}] Observer completed in ${(observerMs / 1000).toFixed(1)}s — ${result.observations.length} chars of new observations`,
+            `[${sid}] Observer completed in ${(observerMs / 1000).toFixed(1)}s — ${result.observations.flatMap((g) => g.entries).length} new entries`,
           );
 
           // Merge new observations with existing ones (both are structured arrays)
@@ -305,7 +307,7 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
         if (!sessionID) return;
         if (childSessions.has(sessionID)) return;
         const memory = await getMemory(storageDir, sessionID);
-        if (!memory.observations) return;
+        if (!memory.observations.length) return;
 
         const optimized = optimizeForContext(memory.observations);
         if (!optimized) return;
@@ -493,10 +495,11 @@ export function observationalMemory(config: ObservationalMemoryConfig = {}) {
       "experimental.session.compacting": async ({ sessionID }, output) => {
         if (childSessions.has(sessionID)) return;
         const memory = await getMemory(storageDir, sessionID);
-        if (!memory.observations) return;
+        if (!memory.observations.length) return;
 
+        const serialized = serializeObservations(memory.observations);
         output.context.push(
-          `\n<observation-log>\n${memory.observations}\n</observation-log>\n\n` +
+          `\n<observation-log>\n${serialized}\n</observation-log>\n\n` +
             "The observation log above contains the compressed history of this session. " +
             "When writing the compaction summary, reference it rather than re-deriving history from the raw messages.",
         );
